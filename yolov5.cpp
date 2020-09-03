@@ -2,6 +2,10 @@
 #include <chrono>
 #include <map>
 #include <vector>
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 #include "cuda_runtime_api.h"
 #include "logging.h"
 #include "common.hpp"
@@ -530,7 +534,7 @@ void doInference(IExecutionContext& context, float* input, float* output, int ba
     CHECK(cudaFree(buffers[outputIndex]));
 }
 
-std::string class_name_by_id(int class_id) {
+std::string classNameById(int classId) {
     static std::map<int, std::string> coco_ids;
 
     if (coco_ids.empty()) {
@@ -552,15 +556,15 @@ std::string class_name_by_id(int class_id) {
         coco_ids[75] = "vase"; coco_ids[76] = "scissors"; coco_ids[77] = "teddy bear"; coco_ids[78] = "hair drier"; coco_ids[79] = "toothbrush";
     }
 
-    if (class_id < 0 || class_id >= 80) {
+    if (classId < 0 || classId >= 80) {
         return std::string("background");
     }
     else {
-        return coco_ids[class_id];
+        return coco_ids[classId];
     }
 }
 
-cv::Scalar class_color_by_id(int class_id) {
+cv::Scalar classColorById(int classId) {
     const int num_classes = 80;
     static int color_tables[num_classes][3];
     static bool is_valid = false;
@@ -575,44 +579,120 @@ cv::Scalar class_color_by_id(int class_id) {
         is_valid = true;
     }
 
-    if (class_id < 0 || class_id >= num_classes) {
+    if (classId < 0 || classId >= num_classes) {
         return cv::Scalar(255, 255, 255);
     }
     else {
-        return cv::Scalar(color_tables[class_id][0], color_tables[class_id][1], color_tables[class_id][2]);
+        return cv::Scalar(color_tables[classId][0], color_tables[classId][1], color_tables[classId][2]);
     }
 }
 
-void draw_outputs(cv::Mat& image, float* outputs, int num_detections) {
-    float score_thresh = 0.35;
-    for (int k = 0; k < num_detections; k++) {
-        float* det = &outputs[0] + k * 7;
-        if (det[2] < score_thresh) {
-            continue;
-        }
-        int xt = int(det[0]);
-        int yt = int(det[1]);
-        int w = int(det[2] - det[0]);
-        int h = int(det[3] - det[1]);
-
-        cv::Rect rect(xt, yt, w, h);
-        cv::Scalar color = class_color_by_id(int(det[5]));
+void drawOutputs(cv::Mat& image, std::vector<Yolo::Detection>& results) {
+    for (size_t k = 0; k < results.size(); k++) {
+        cv::Rect rect = get_rect(image, results[k].bbox);
+        cv::Scalar color = classColorById(int(results[k].class_id));
         int thick = int(0.7 * (image.rows + image.cols) / 700.F);
         cv::rectangle(image, rect, color, thick);
 
-        std::string id_s = class_name_by_id(int(det[5]));
+        std::string id_str = classNameById(int(results[k].class_id));
         char buffer[20] = {0};
-        sprintf(buffer, "%s %.2f", id_s.data(), det[4]);
+        sprintf(buffer, "%s %.2f", id_str.data(), results[k].conf);
         std::string text(buffer);
         int fontFace = cv::FONT_HERSHEY_SIMPLEX;
         double fontScale = 0.4;
         int baseline;
         cv::Size size = cv::getTextSize(text, fontFace, fontScale, thick / 2, &baseline);
-        cv::Rect rect_t(xt, yt - (size.height + 8), size.width + 4, size.height + 8);
+        cv::Rect rect_t(rect.x, rect.y - (size.height + 8), size.width + 4, size.height + 8);
         cv::rectangle(image, rect_t, color, -1);
-        cv::putText(image, text, cv::Point(xt, yt - 5), fontFace, fontScale, 
+        cv::putText(image, text, cv::Point(rect.x, rect.y - 5), fontFace, fontScale, 
 			cv::Scalar(255, 255, 255), thick / 2);
     }
+}
+
+void preprocessCopy(cv::Mat& img, float* data_ptr) {
+    cv::Mat pr_img = preprocess_img(img);
+    int k = 0;
+    for (int row = 0; row < INPUT_H; ++row) {
+        uchar* uc_pixel = pr_img.data + row * pr_img.step;
+        for (int col = 0; col < INPUT_W; ++col) {
+            data_ptr[k] = (float)uc_pixel[2] / 255.0;
+            data_ptr[k + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
+            data_ptr[k + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
+            uc_pixel += 3;
+            ++k;
+        }
+    }
+}
+
+void yoloDetect(IExecutionContext* context, cv::VideoCapture& capture) {
+    assert(BATCH_SIZE == 1);
+    static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+    static float outputs[BATCH_SIZE * OUTPUT_SIZE];
+
+    cv::Mat frame;
+    while(true) {
+        auto start_time = std::chrono::system_clock::now();
+        capture >> frame;
+        if (frame.empty()) {
+            break;
+        }
+        preprocessCopy(frame, data);
+        doInference(*context, data, outputs, BATCH_SIZE);
+        std::vector<Yolo::Detection> results;
+        nms(results, &outputs[0 * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
+        drawOutputs(frame, results);
+        auto stop_time = std::chrono::system_clock::now();
+
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop_time - start_time);
+        float duration_sec = float(duration.count()) * std::chrono::microseconds::period::num / 
+            std::chrono::microseconds::period::den;
+        float FPS = 1.F / duration_sec;
+
+        char buffer[20] = {0};
+        sprintf(buffer, "FPS: %d", int(FPS));
+        int fontFace = cv::FONT_HERSHEY_SIMPLEX;
+        double fontScale = 0.5;
+        cv::putText(frame, std::string(buffer), cv::Point(20, 30), fontFace, fontScale, 
+            cv::Scalar(255, 255, 255), 2);
+
+        cv::imshow("video", frame);
+        if (char(cv::waitKey(1)) == 'q') {
+            break;
+        }
+    }
+}
+
+void cameraDetect(IExecutionContext* context, int cam_id) {
+    cv::VideoCapture capture(cam_id);
+    capture.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    capture.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    capture.set(cv::CAP_PROP_FPS, 30);
+    std::cout << "opening camera " << cam_id << " ..." << std::endl;
+    yoloDetect(context, capture);
+}
+
+void videoDetect(IExecutionContext* context, std::string& video_file) {
+    cv::VideoCapture capture(video_file);
+    capture.set(cv::CAP_PROP_FRAME_WIDTH, 960);
+    capture.set(cv::CAP_PROP_FRAME_HEIGHT, 640);
+    capture.set(cv::CAP_PROP_FPS, 30);
+    std::cout << "opening video " << video_file << " ..." << std::endl;
+    yoloDetect(context, capture);
+}
+
+char* readEngineFile(std::string& engineFile, size_t& size) {
+    char* stream_ptr = nullptr;
+    std::ifstream file(engineFile, std::ios::binary);
+    if (file.good()) {
+        file.seekg(0, file.end);
+        size = file.tellg();
+        file.seekg(0, file.beg);
+        stream_ptr = new char[size];
+        file.read(stream_ptr, size);
+        file.close();
+    }
+    assert(stream_ptr);
+    return stream_ptr;
 }
 
 int main(int argc, char** argv) {
@@ -620,6 +700,7 @@ int main(int argc, char** argv) {
     // create a model using the API directly and serialize it to a stream
     char *trtModelStream{nullptr};
     size_t size{0};
+    int detectMode = 1; // detection using images
     if (argc == 3 && std::string(argv[1]) == "-s") {
         IHostMemory* modelStream{nullptr};
 		std::string modelType(argv[2]);
@@ -637,16 +718,17 @@ int main(int argc, char** argv) {
     } else if (argc == 5 && std::string(argv[1]) == "-e" && std::string(argv[3]) == "-d") {
         std::string modelType(argv[2]);
         std::string engineFile = ParseModelPath(modelType, true);
-        std::ifstream file(engineFile, std::ios::binary);
-        if (file.good()) {
-            file.seekg(0, file.end);
-            size = file.tellg();
-            file.seekg(0, file.beg);
-            trtModelStream = new char[size];
-            assert(trtModelStream);
-            file.read(trtModelStream, size);
-            file.close();
-        }
+        trtModelStream = readEngineFile(engineFile, size);
+    } else if (argc == 5 && std::string(argv[1]) == "-e" && std::string(argv[3]) == "-v") {
+        std::string modelType(argv[2]);
+        std::string engineFile = ParseModelPath(modelType, true);
+        trtModelStream = readEngineFile(engineFile, size);
+        detectMode = 2; // detection using video file
+    } else if (argc == 5 && std::string(argv[1]) == "-e" && std::string(argv[3]) == "-c") {
+        std::string modelType(argv[2]);
+        std::string engineFile = ParseModelPath(modelType, true);
+        trtModelStream = readEngineFile(engineFile, size);
+        detectMode = 3; // detection using camera stream
     } else {
         std::cerr << "arguments not right!" << std::endl;
         std::cerr << "./yolov5 -s s // serialize model to plan file" << std::endl;
@@ -654,17 +736,6 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    std::vector<std::string> file_names;
-    if (read_files_in_dir(argv[4], file_names) < 0) {
-        std::cout << "read_files_in_dir failed." << std::endl;
-        return -1;
-    }
-
-    // prepare input data ---------------------------
-    static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
-    //    data[i] = 1.0;
-    static float prob[BATCH_SIZE * OUTPUT_SIZE];
     IRuntime* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
     ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
@@ -673,49 +744,71 @@ int main(int argc, char** argv) {
     assert(context != nullptr);
     delete[] trtModelStream;
 
-    int fcount = 0;
-    for (int f = 0; f < (int)file_names.size(); f++) {
-        fcount++;
-        if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
-        for (int b = 0; b < fcount; b++) {
-            cv::Mat img = cv::imread(std::string(argv[4]) + "/" + file_names[f - fcount + 1 + b]);
-            if (img.empty()) continue;
-            cv::Mat pr_img = preprocess_img(img); // letterbox BGR to RGB
-            int i = 0;
-            for (int row = 0; row < INPUT_H; ++row) {
-                uchar* uc_pixel = pr_img.data + row * pr_img.step;
-                for (int col = 0; col < INPUT_W; ++col) {
-                    data[b * 3 * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
-                    uc_pixel += 3;
-                    ++i;
-                }
-            }
+    if (detectMode == 2) {
+        std::string video_file(argv[4]);
+        videoDetect(context, video_file);
+    }
+    else if (detectMode == 3) {
+        int cam_id = atoi(argv[4]);
+        cameraDetect(context, cam_id);
+    } else {
+        std::vector<std::string> file_names;
+        if (read_files_in_dir(argv[4], file_names) < 0) {
+            std::cout << "read_files_in_dir failed." << std::endl;
+            return -1;
         }
 
-        // Run inference
-        auto start = std::chrono::system_clock::now();
-        doInference(*context, data, prob, BATCH_SIZE);
-        auto end = std::chrono::system_clock::now();
-        std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-        std::vector<std::vector<Yolo::Detection>> batch_res(fcount);
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            nms(res, &prob[b * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
-        }
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            //std::cout << res.size() << std::endl;
-            cv::Mat img = cv::imread(std::string(argv[4]) + "/" + file_names[f - fcount + 1 + b]);
-            for (size_t j = 0; j < res.size(); j++) {
-                cv::Rect r = get_rect(img, res[j].bbox);
-                cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
-                cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+        // prepare input data ---------------------------
+        static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+        //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
+        //    data[i] = 1.0;
+        static float prob[BATCH_SIZE * OUTPUT_SIZE];
+
+        int fcount = 0;
+        for (int f = 0; f < (int)file_names.size(); f++) {
+            fcount++;
+            if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
+            for (int b = 0; b < fcount; b++) {
+                cv::Mat img = cv::imread(std::string(argv[4]) + "/" + file_names[f - fcount + 1 + b]);
+                if (img.empty()) continue;
+                cv::Mat pr_img = preprocess_img(img); // letterbox BGR to RGB
+                int i = 0;
+                for (int row = 0; row < INPUT_H; ++row) {
+                    uchar* uc_pixel = pr_img.data + row * pr_img.step;
+                    for (int col = 0; col < INPUT_W; ++col) {
+                        data[b * 3 * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
+                        data[b * 3 * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
+                        data[b * 3 * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
+                        uc_pixel += 3;
+                        ++i;
+                    }
+                }
             }
-            cv::imwrite("_" + file_names[f - fcount + 1 + b], img);
+
+            // Run inference
+            auto start = std::chrono::system_clock::now();
+            doInference(*context, data, prob, BATCH_SIZE);
+            auto end = std::chrono::system_clock::now();
+            std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+            std::vector<std::vector<Yolo::Detection>> batch_res(fcount);
+            for (int b = 0; b < fcount; b++) {
+                auto& res = batch_res[b];
+                nms(res, &prob[b * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
+            }
+            for (int b = 0; b < fcount; b++) {
+                auto& res = batch_res[b];
+                //std::cout << res.size() << std::endl;
+                cv::Mat img = cv::imread(std::string(argv[4]) + "/" + file_names[f - fcount + 1 + b]);
+                for (size_t j = 0; j < res.size(); j++) {
+                    cv::Rect r = get_rect(img, res[j].bbox);
+                    cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
+                    cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), 
+                        cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+                }
+                cv::imwrite("_" + file_names[f - fcount + 1 + b], img);
+            }
+            fcount = 0;
         }
-        fcount = 0;
     }
 
     // Destroy the engine
