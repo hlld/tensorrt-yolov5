@@ -24,19 +24,19 @@ This repo contains a slightly modified version of [tensorrtx](https://github.com
 ```
 1. generate yolov5sv3.wts from pytorch with yolov5sv3.pt
 
-git clone https://github.com/wang-xinyu/tensorrtx.git
+git clone https://github.com/hlld/tensorrt-yolov5.git
 git clone https://github.com/ultralytics/yolov5.git
 // download its weights 'yolov5sv3.pt'
-// copy tensorrtx/yolov5/gen_wts.py into ultralytics/yolov5
+// copy tensorrt-yolov5/yolov5/gen_wts.py into ultralytics/yolov5
 // ensure the file name is yolov5sv3.pt and yolov5sv3.wts in gen_wts.py
 // go to ultralytics/yolov5
 python gen_wts.py
 // a file 'yolov5sv3.wts' will be generated.
 
-2. build tensorrtx/yolov5 and run
+2. build tensorrt-yolov5/yolov5 and run
 
-// put yolov5sv3.wts into tensorrtx/yolov5
-// go to tensorrtx/yolov5
+// put yolov5sv3.wts into tensorrt-yolov5/yolov5
+// go to tensorrt-yolov5/yolov5
 mkdir build
 cd build
 cmake ..
