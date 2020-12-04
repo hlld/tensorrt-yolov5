@@ -624,10 +624,26 @@ void preprocessCopy(cv::Mat& img, float* data_ptr) {
     }
 }
 
-void yoloDetect(IExecutionContext* context, cv::VideoCapture& capture) {
+void yoloDetect(IExecutionContext* context, cv::VideoCapture& capture, float* input, float* output) {
     assert(BATCH_SIZE == 1);
-    static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    static float outputs[BATCH_SIZE * OUTPUT_SIZE];
+	const ICudaEngine& engine = context->getEngine();
+
+    // Pointers to input and output device buffers to pass to engine.
+    // Engine requires exactly IEngine::getNbBindings() number of buffers.
+    assert(engine.getNbBindings() == 2);
+    void* buffers[2];
+
+    // In order to bind the buffers, we need to know the names of the input and output tensors.
+    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
+    const int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME);
+    const int outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
+
+	// Create GPU buffers on device
+    CHECK(cudaMalloc(&buffers[inputIndex], BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float)));
+    CHECK(cudaMalloc(&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+
+	cudaStream_t stream;
+    CHECK(cudaStreamCreate(&stream));
 
     cv::Mat frame;
     while(true) {
@@ -636,10 +652,16 @@ void yoloDetect(IExecutionContext* context, cv::VideoCapture& capture) {
         if (frame.empty()) {
             break;
         }
-        preprocessCopy(frame, data);
-        doInference(*context, data, outputs, BATCH_SIZE);
+        preprocessCopy(frame, input);
+
+		// DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
+		CHECK(cudaMemcpyAsync(buffers[inputIndex], input, BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
+		context->enqueue(BATCH_SIZE, buffers, stream, nullptr);
+		CHECK(cudaMemcpyAsync(output, buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
+		cudaStreamSynchronize(stream);
+
         std::vector<Yolo::Detection> results;
-        nms(results, &outputs[0 * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
+        nms(results, &output[0 * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
         drawOutputs(frame, results);
         auto stop_time = std::chrono::system_clock::now();
 
@@ -660,24 +682,29 @@ void yoloDetect(IExecutionContext* context, cv::VideoCapture& capture) {
             break;
         }
     }
+
+	// Release stream and buffers
+    cudaStreamDestroy(stream);
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex]));
 }
 
-void cameraDetect(IExecutionContext* context, int cam_id) {
+void cameraDetect(IExecutionContext* context, int cam_id, float* input, float* output) {
     cv::VideoCapture capture(cam_id);
     capture.set(cv::CAP_PROP_FRAME_WIDTH, 640);
     capture.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    capture.set(cv::CAP_PROP_FPS, 30);
+    //capture.set(cv::CAP_PROP_FPS, 30);
     std::cout << "opening camera " << cam_id << " ..." << std::endl;
-    yoloDetect(context, capture);
+    yoloDetect(context, capture, input, output);
 }
 
-void videoDetect(IExecutionContext* context, std::string& video_file) {
+void videoDetect(IExecutionContext* context, std::string& video_file, float* input, float* output) {
     cv::VideoCapture capture(video_file);
-    capture.set(cv::CAP_PROP_FRAME_WIDTH, 960);
-    capture.set(cv::CAP_PROP_FRAME_HEIGHT, 640);
-    capture.set(cv::CAP_PROP_FPS, 30);
+    capture.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    capture.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    //capture.set(cv::CAP_PROP_FPS, 30);
     std::cout << "opening video " << video_file << " ..." << std::endl;
-    yoloDetect(context, capture);
+    yoloDetect(context, capture, input, output);
 }
 
 char* readEngineFile(std::string& engineFile, size_t& size) {
@@ -744,25 +771,25 @@ int main(int argc, char** argv) {
     assert(context != nullptr);
     delete[] trtModelStream;
 
+	// prepare input data ---------------------------
+	static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+	//for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
+	//    data[i] = 1.0;
+	static float prob[BATCH_SIZE * OUTPUT_SIZE];
+
     if (detectMode == 2) {
         std::string video_file(argv[4]);
-        videoDetect(context, video_file);
+        videoDetect(context, video_file, data, prob);
     }
     else if (detectMode == 3) {
         int cam_id = atoi(argv[4]);
-        cameraDetect(context, cam_id);
+        cameraDetect(context, cam_id, data, prob);
     } else {
         std::vector<std::string> file_names;
         if (read_files_in_dir(argv[4], file_names) < 0) {
             std::cout << "read_files_in_dir failed." << std::endl;
             return -1;
         }
-
-        // prepare input data ---------------------------
-        static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-        //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
-        //    data[i] = 1.0;
-        static float prob[BATCH_SIZE * OUTPUT_SIZE];
 
         int fcount = 0;
         for (int f = 0; f < (int)file_names.size(); f++) {
